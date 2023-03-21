@@ -1,0 +1,10 @@
+[package]
+name = "chip-8-desktop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chip-8-core = { path = "../chip-8-core" }
+crevice = "0.12.0"
+ggez = "0.8.1"
+wgpu = "0.14"
