@@ -1,8 +1,3 @@
-#[cfg(target_arch = "x86")]
-use std::arch::x86::*;
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
-
 use chip_8_core::*;
 use ggez::graphics;
 use std::mem::{self, size_of};
@@ -109,7 +104,7 @@ impl Screen {
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
-                    contents: &fix_u32_endianness(&BLACK),
+                    contents: &BLACK, // no need to fix endianness for zeroes
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 });
 
@@ -119,9 +114,7 @@ impl Screen {
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
-                    contents: unsafe {
-                        std::mem::transmute::<&u32, &[u8; 4]>(&(SCREEN_SCALE_FACTOR as u32))
-                    },
+                    contents: &u32::to_ne_bytes(SCREEN_SCALE_FACTOR as u32),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
 
@@ -167,144 +160,47 @@ impl Screen {
             .queue
             .write_buffer(&self.pixel_buffer, 0, &fix_u32_endianness(fb));
 
-        {
-            let frame = ctx.gfx.frame().clone();
-            let cmd = ctx.gfx.commands().unwrap();
+        let frame = ctx.gfx.frame().clone();
+        let cmd = ctx.gfx.commands().unwrap();
 
-            let mut pass = cmd.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame.wgpu().1,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(
-                            graphics::LinearColor::from(graphics::Color::new(0.5, 0.4, 0.2, 1.0))
-                                .into(),
-                        ),
-                        store: true,
-                    },
-                })],
-                depth_stencil_attachment: None,
-            });
+        let mut pass = cmd.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: frame.wgpu().1,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(
+                        graphics::LinearColor::from(graphics::Color::new(0.5, 0.4, 0.2, 1.0))
+                            .into(),
+                    ),
+                    store: true,
+                },
+            })],
+            depth_stencil_attachment: None,
+        });
 
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_vertex_buffer(0, self.verts.slice(..));
-            pass.set_index_buffer(self.inds.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..3, 0, 0..1);
-        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, self.verts.slice(..));
+        pass.set_index_buffer(self.inds.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..3, 0, 0..1);
 
         Ok(())
     }
 }
 
-// Utility functions to correctly reinterpret the u8 FrameBuffer as a buffer of u32
-#[cfg(all(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    target_feature = "avx2"
-))]
+/* Utility function to correctly reinterpret the u8 FrameBuffer as a buffer of u32 */
 fn fix_u32_endianness(bytes_slice: &FrameBuffer) -> FrameBuffer {
-    const BUFFER_SIZE: usize = size_of::<FrameBuffer>() / size_of::<__m256i>();
-
-    // copy the FrameBuffer
-    let mut buffer: [__m256i; BUFFER_SIZE] =
-        unsafe { std::mem::transmute_copy::<FrameBuffer, [__m256i; BUFFER_SIZE]>(bytes_slice) };
-
-    #[rustfmt::skip]
-    const SHUFFLE_CONTROL_MASK: [u8; 32] = [
-        // twice the permutation ABCD EFGH IJKL MNOP -> DCBA HGFE LKJI PONM
-        // `_mm256_shuffle_epi8()` reads only the bottom 4 bits of each byte in the control mask
-        0x03, 0x02, 0x01, 0x00,
-        0x07, 0x06, 0x05, 0x04,
-        0x0B, 0x0A, 0x09, 0x08,
-        0x0F, 0x0E, 0x0D, 0x0C,
-        0x03, 0x02, 0x01, 0x00,
-        0x07, 0x06, 0x05, 0x04,
-        0x0B, 0x0A, 0x09, 0x08,
-        0x0F, 0x0E, 0x0D, 0x0C,
-    ];
-
-    #[rustfmt::skip]
-    buffer.iter_mut().for_each(|x| {
-        *x = unsafe {
-            _mm256_shuffle_epi8(
-                *x,
-                mem::transmute_copy(&SHUFFLE_CONTROL_MASK))
-        };
-    });
-
-    unsafe { *(&buffer as *const [__m256i; BUFFER_SIZE] as *const FrameBuffer) }
-}
-
-#[cfg(all(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    not(target_feature = "avx2"),
-    target_feature = "ssse3"
-))]
-fn fix_u32_endianness(bytes_slice: &FrameBuffer) -> FrameBuffer {
-    const BUFFER_SIZE: usize = size_of::<FrameBuffer>() / size_of::<__m128i>();
-
-    // copy the FrameBuffer
-    let mut buffer: [__m128i; BUFFER_SIZE] =
-        unsafe { std::mem::transmute_copy::<FrameBuffer, [__m128i; BUFFER_SIZE]>(bytes_slice) };
-
-    // cast the argument to be of the same type as `buffer`
-    let slice_cast =
-        unsafe { *(bytes_slice as *const FrameBuffer as *const [__m128i; BUFFER_SIZE]) };
-
-    /* Although defining slice_cast first and then defining `mut buffer = slice_cast.clone()` would
-     * arguably be more elegant, cloning the buffer the way we do adds a static check to ensure
-     * that the two arrays have indeed the same size
-     */
-
-    #[rustfmt::skip]
-    const SHUFFLE_CONTROL_MASK: [u8; 16] = [
-        // permutation ABCD EFGH IJKL MNOP -> DCBA HGFE LKJI PONM
-        // `_mm_shuffle_epi8()` reads only the bottom 4 bits of each byte in the control mask
-        0x03, 0x02, 0x01, 0x00,
-        0x07, 0x06, 0x05, 0x04,
-        0x0B, 0x0A, 0x09, 0x08,
-        0x0F, 0x0E, 0x0D, 0x0C,
-    ];
-
-    #[rustfmt::skip]
-    buffer.iter_mut().enumerate().for_each(|(i, x)| {
-        *x = unsafe {
-            _mm_shuffle_epi8(
-                slice_cast[i],
-                mem::transmute_copy(&SHUFFLE_CONTROL_MASK)
-            )
-        };
-    });
-
-    unsafe { *(&buffer as *const [__m128i; BUFFER_SIZE] as *const FrameBuffer) }
-}
-
-#[cfg(all(
-    not(target_endian = "big"),
-    not(any(target_feature = "avx2", target_feature = "ssse3"))
-))]
-fn fix_u32_endianness(bytes_slice: &FrameBuffer) -> FrameBuffer {
-    let mut buffer = bytes_slice.clone();
+    let mut buffer = [0; size_of::<FrameBuffer>()];
 
     bytes_slice
         .chunks(4)
         .zip(buffer.chunks_mut(4))
         .for_each(|(v_in, v_out)| {
-            v_out[0] = v_in[3];
-            v_out[1] = v_in[2];
-            v_out[2] = v_in[1];
-            v_out[3] = v_in[0];
+            v_out.copy_from_slice(&u32::to_ne_bytes(u32::from_be_bytes(
+                v_in.try_into().unwrap(),
+            )));
         });
 
     buffer
-}
-
-#[cfg(target_endian = "big")]
-fn fix_u32_endianness(bytes_slice: &FrameBuffer) -> FrameBuffer {
-    /* in theory we could avoid the copy and pick a better name for the function, but realistically
-     * (1) the impact is negligible,
-     * (2) this code will never run on a big-endian architecture
-     */
-    bytes_slice.clone()
 }
