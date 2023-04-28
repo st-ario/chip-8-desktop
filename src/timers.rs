@@ -2,6 +2,17 @@ use ggez::audio::SoundSource;
 use spin_sleep::SpinSleeper;
 use std::sync::atomic::AtomicI16;
 
+pub struct DelayTimer {
+    value: AtomicI16, // can transiently be -1, in which case it's safe to treat it as == 0
+    sleeper: SpinSleeper,
+}
+
+pub struct SoundTimer {
+    value: AtomicI16, // can transiently be -1, in which case it's safe to treat it as == 0
+    sleeper: SpinSleeper,
+    sound: ggez::audio::Source,
+}
+
 pub trait Timer: details::Timer {
     fn start(&self) -> !;
 
@@ -14,17 +25,6 @@ pub trait Timer: details::Timer {
         use std::sync::atomic::Ordering::Relaxed;
         self.get_value().store(val as i16, Relaxed)
     }
-}
-
-pub struct DelayTimer {
-    value: AtomicI16, // can transiently be -1, in which case it's safe to treat it as == 0
-    sleeper: SpinSleeper,
-}
-
-pub struct SoundTimer {
-    value: AtomicI16, // can transiently be -1, in which case it's safe to treat it as == 0
-    sleeper: SpinSleeper,
-    sound: ggez::audio::Source,
 }
 
 impl DelayTimer {
@@ -49,6 +49,7 @@ impl SoundTimer {
     }
 }
 
+/* expose getters only in this module */
 mod details {
     pub trait Timer {
         fn get_value(&self) -> &std::sync::atomic::AtomicI16;
