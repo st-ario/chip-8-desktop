@@ -29,7 +29,7 @@ pub struct Screen {
 }
 
 impl Screen {
-    pub fn new(ctx: &mut ggez::Context, fb: &FrameBuffer) -> ggez::GameResult<Screen> {
+    pub fn new(ctx: &ggez::Context) -> ggez::GameResult<Screen> {
         let shader = ctx
             .gfx
             .wgpu()
@@ -102,13 +102,14 @@ impl Screen {
                     multiview: None,
                 });
 
+        const BLACK: FrameBuffer = [0; 256];
         let pixel_buffer =
             ctx.gfx
                 .wgpu()
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
-                    contents: &fix_u32_endianness(fb),
+                    contents: &fix_u32_endianness(&BLACK),
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 });
 
@@ -160,7 +161,7 @@ impl Screen {
         })
     }
 
-    pub fn draw(&mut self, ctx: &mut ggez::Context, fb: &FrameBuffer) -> ggez::GameResult {
+    pub fn draw(&self, ctx: &mut ggez::Context, fb: &FrameBuffer) -> ggez::GameResult {
         ctx.gfx
             .wgpu()
             .queue
@@ -209,15 +210,6 @@ fn fix_u32_endianness(bytes_slice: &FrameBuffer) -> FrameBuffer {
     let mut buffer: [__m256i; BUFFER_SIZE] =
         unsafe { std::mem::transmute_copy::<FrameBuffer, [__m256i; BUFFER_SIZE]>(bytes_slice) };
 
-    // cast the argument to be of the same type as `buffer`
-    let slice_cast =
-        unsafe { *(bytes_slice as *const FrameBuffer as *const [__m256i; BUFFER_SIZE]) };
-
-    /* Although defining slice_cast first and then defining `mut buffer = slice_cast.clone()` would
-     * arguably be more elegant, cloning the buffer the way we do adds a static check to ensure
-     * that the two arrays have indeed the same size
-     */
-
     #[rustfmt::skip]
     const SHUFFLE_CONTROL_MASK: [u8; 32] = [
         // twice the permutation ABCD EFGH IJKL MNOP -> DCBA HGFE LKJI PONM
@@ -233,12 +225,11 @@ fn fix_u32_endianness(bytes_slice: &FrameBuffer) -> FrameBuffer {
     ];
 
     #[rustfmt::skip]
-    buffer.iter_mut().enumerate().for_each(|(i, x)| {
+    buffer.iter_mut().for_each(|x| {
         *x = unsafe {
             _mm256_shuffle_epi8(
-                slice_cast[i],
-                mem::transmute_copy(&SHUFFLE_CONTROL_MASK)
-            )
+                *x,
+                mem::transmute_copy(&SHUFFLE_CONTROL_MASK))
         };
     });
 
