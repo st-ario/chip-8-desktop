@@ -11,8 +11,9 @@ pub type KeyMessage = (u8, KeyAction);
 pub type KeyValue = u8;
 
 pub struct KeyboardManager {
-    last_key: Mutex<Option<KeyValue>>, // initialized as None, after assignment can only be made None again by wait_for_key()
     pressed_keys: Mutex<[bool; 16]>,
+    last_key: Mutex<Option<KeyValue>>, // initialized as None, after first assignment can only be
+                                       // be made None again by wait_for_key()
 }
 
 impl KeyboardManager {
@@ -31,7 +32,6 @@ impl KeyboardManager {
     }
 
     fn start(&self, rx_in: Receiver<KeyMessage>) {
-        //for received in &rx_in {
         loop {
             let received_res = rx_in.recv();
             if received_res.is_err() {
