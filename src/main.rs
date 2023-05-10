@@ -7,36 +7,9 @@ mod timers;
 
 use emulator::*;
 use screen::*;
-use std::pin::Pin;
-
-impl<'a> ggez::event::EventHandler<ggez::GameError> for Pin<Box<Emulator<'a>>> {
-    fn update(&mut self, _ctx: &mut ggez::Context) -> ggez::GameResult {
-        self.as_mut().update()
-    }
-
-    fn key_down_event(
-        &mut self,
-        _ctx: &mut ggez::Context,
-        input: ggez::input::keyboard::KeyInput,
-        _repeated: bool,
-    ) -> Result<(), ggez::GameError> {
-        self.as_mut().key_down_event(input)
-    }
-
-    fn key_up_event(
-        &mut self,
-        _ctx: &mut ggez::Context,
-        input: ggez::input::keyboard::KeyInput,
-    ) -> Result<(), ggez::GameError> {
-        self.as_mut().key_up_event(input)
-    }
-
-    fn draw(&mut self, ctx: &mut ggez::Context) -> ggez::GameResult {
-        self.as_ref().draw(ctx)
-    }
-}
 
 fn main() -> ggez::GameResult {
+
     let args: Vec<String> = std::env::args().collect();
 
     let filepath = &args[1];

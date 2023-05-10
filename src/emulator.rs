@@ -1,31 +1,210 @@
 use crate::keyboard::*;
 use crate::screen::*;
 use crate::timers::*;
-use chip_8_core::{Chip8, FrameBuffer, IOCallbacks};
+use chip_8_core::{Chip8, IOCallbacks};
 use ggez::audio::SoundSource;
+use ggez::input::keyboard;
 use std::pin::Pin;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
-pub struct Emulator<'a> {
-    _pin: std::marker::PhantomPinned, // self-referential
+pub struct Emulator {
+    internals: Pin<Arc<EmulatorInternals>>,
     sleeper: spin_sleep::SpinSleeper,
     keyboard_status: [bool; 16],
-    keyboard_send_channel: Sender<KeyMessage>,
-    screen: Screen,
-    core: Chip8<'a>,
-    // dyn Fn(...) is !Unpin
-    time_setter: Pin<Box<dyn Fn(u8) + 'a>>,
-    time_getter: Pin<Box<dyn Fn() -> u8 + 'a>>,
-    sound_setter: Pin<Box<dyn Fn(u8) + 'a>>,
-    next_rand: Pin<Box<dyn Fn() -> u8 + 'a>>,
-    is_pressed: Pin<Box<dyn Fn(u8) -> bool + 'a>>,
-    wait_for_key: Pin<Box<dyn Fn() -> u8 + 'a>>,
+    update_sync_pair: Arc<(Condvar, Mutex<State>)>,
 }
 
-impl<'a> Emulator<'a> {
-    pub fn new(ctx: &ggez::Context, program: &[u8]) -> ggez::GameResult<Pin<Box<Self>>> {
+/* state machine to handle waiting on a keypress */
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum State {
+    #[default]
+    Ready,
+    UpdateRequested,
+    WaitingForKey,
+}
+
+impl Emulator {
+    pub fn new(ctx: &ggez::Context, program: &[u8]) -> ggez::GameResult<Self> {
+        let sync_pair = Arc::new((Condvar::new(), Mutex::new(State::default())));
+        let sync_copy = Arc::clone(&sync_pair);
+
+        Ok(Emulator {
+            internals: EmulatorInternals::new(ctx, program, sync_copy)?,
+            sleeper: spin_sleep::SpinSleeper::default(),
+            keyboard_status: [false; 16],
+            update_sync_pair: sync_pair,
+        })
+    }
+}
+
+impl ggez::event::EventHandler<ggez::GameError> for Emulator {
+    fn update(&mut self, _ctx: &mut ggez::Context) -> ggez::GameResult {
+        use std::time::SystemTime;
+
+        /* emulation speed parameters */
+        const TARGET_EMULATION_CLOCK_HZ: u16 = 500; // TODO user-settable with default value
+        const TARGET_CLOCK_NS: u64 = (1_000_000.0 / TARGET_EMULATION_CLOCK_HZ as f64) as u64;
+
+        /* multiple instructions per tick, to reduce jittering */
+        // if the nubmer is too high, the input lag will become noticeable;
+        // input lag should stay below 50 ms
+        // as the emulated clock should be in the 400-1000 Hz, 10 instruction per emulator tick
+        // should keep the input lag at 10-25 ms + system input lag (negligible)
+        const INSTRUCTIONS_PER_TICK: u64 = 10;
+        const TIME_BUDGET_NS: u64 = TARGET_CLOCK_NS * INSTRUCTIONS_PER_TICK;
+
+        /* time-skipping */
+        // sleep only if we're ahead of more than 1/ACCURACY_FACTOR of
+        // a target-clock-tick (on average, checked per emulator tick)
+        // this means that we will skip the sleeping instruction only if the emulator tick took
+        // almost as much time as the emulated system would have taken, or longer
+        // (highly unlikely on a modern computer)
+        const ACCURACY_FACTOR: u64 = 10;
+        const TARGET_ACCURACY_NS: u64 = INSTRUCTIONS_PER_TICK * TARGET_CLOCK_NS / ACCURACY_FACTOR;
+
+        let now = SystemTime::now();
+
+        // this function is called on the main thread by the ggez runtime, so it can't block for too long;
+        // `mtx` is shared only with `execute_next_instruction()`, which acquires it only when it
+        // can no longer block
+        let mut i: u64 = 0;
+        while i < INSTRUCTIONS_PER_TICK {
+            let (cond, mtx) = self.update_sync_pair.as_ref();
+
+            // signal update request, unless we're still waiting from a previous iteration
+            {
+                let mut state = mtx.lock().unwrap();
+
+                if *state == State::WaitingForKey {
+                    break;
+                }
+
+                *state = State::UpdateRequested;
+            }
+            cond.notify_all();
+
+            // wait for feedback message
+            let state;
+            {
+                let mut feedback = mtx.lock().unwrap();
+
+                while *feedback == State::UpdateRequested {
+                    feedback = cond.wait(feedback).unwrap();
+                }
+
+                state = *feedback;
+            }
+
+            match state {
+                State::WaitingForKey => break,
+                State::Ready => {}
+                State::UpdateRequested => unreachable!(),
+            }
+
+            i += 1;
+        }
+
+        let elapsed = now.elapsed().unwrap().subsec_nanos() as u64;
+
+        // avoid underflow in TIME_BUDGET - elapsed > TARGET_ACCURACY
+        if TIME_BUDGET_NS > TARGET_ACCURACY_NS + elapsed {
+            self.sleeper.sleep_ns(TIME_BUDGET_NS - elapsed);
+        }
+
+        // TODO measure time difference between consecutive calls to give an estimate of the
+        // systematic error on our per-tick time management
+
+        Ok(())
+    }
+
+    fn key_down_event(
+        &mut self,
+        _ctx: &mut ggez::Context,
+        input: keyboard::KeyInput,
+        _repeated: bool,
+    ) -> Result<(), ggez::GameError> {
+        // do not send more than one "pressed" signal if key is held
+        #[rustfmt::skip]
+        let keycode: u8 = match input.scancode {
+            0x2D => { if !self.keyboard_status[0x0] {self.keyboard_status[0x0] = true; 0x0} else { return Ok(()) } },
+            0x02 => { if !self.keyboard_status[0x1] {self.keyboard_status[0x1] = true; 0x1} else { return Ok(()) } },
+            0x03 => { if !self.keyboard_status[0x2] {self.keyboard_status[0x2] = true; 0x2} else { return Ok(()) } },
+            0x04 => { if !self.keyboard_status[0x3] {self.keyboard_status[0x3] = true; 0x3} else { return Ok(()) } },
+            0x10 => { if !self.keyboard_status[0x4] {self.keyboard_status[0x4] = true; 0x4} else { return Ok(()) } },
+            0x11 => { if !self.keyboard_status[0x5] {self.keyboard_status[0x5] = true; 0x5} else { return Ok(()) } },
+            0x12 => { if !self.keyboard_status[0x6] {self.keyboard_status[0x6] = true; 0x6} else { return Ok(()) } },
+            0x1E => { if !self.keyboard_status[0x7] {self.keyboard_status[0x7] = true; 0x7} else { return Ok(()) } },
+            0x1F => { if !self.keyboard_status[0x8] {self.keyboard_status[0x8] = true; 0x8} else { return Ok(()) } },
+            0x20 => { if !self.keyboard_status[0x9] {self.keyboard_status[0x9] = true; 0x9} else { return Ok(()) } },
+            0x2C => { if !self.keyboard_status[0xA] {self.keyboard_status[0xA] = true; 0xA} else { return Ok(()) } },
+            0x2E => { if !self.keyboard_status[0xB] {self.keyboard_status[0xB] = true; 0xB} else { return Ok(()) } },
+            0x05 => { if !self.keyboard_status[0xC] {self.keyboard_status[0xC] = true; 0xC} else { return Ok(()) } },
+            0x13 => { if !self.keyboard_status[0xD] {self.keyboard_status[0xD] = true; 0xD} else { return Ok(()) } },
+            0x21 => { if !self.keyboard_status[0xE] {self.keyboard_status[0xE] = true; 0xE} else { return Ok(()) } },
+            0x2F => { if !self.keyboard_status[0xF] {self.keyboard_status[0xF] = true; 0xF} else { return Ok(()) } },
+            _ => return Ok(()),
+        };
+
+        self.internals.as_ref().key_down_event(keycode)
+    }
+
+    fn key_up_event(
+        &mut self,
+        _ctx: &mut ggez::Context,
+        input: ggez::input::keyboard::KeyInput,
+    ) -> Result<(), ggez::GameError> {
+        #[rustfmt::skip]
+        let keycode: u8 = match input.scancode {
+            0x2D => { self.keyboard_status[0x0] = false; 0x0 },
+            0x02 => { self.keyboard_status[0x1] = false; 0x1 },
+            0x03 => { self.keyboard_status[0x2] = false; 0x2 },
+            0x04 => { self.keyboard_status[0x3] = false; 0x3 },
+            0x10 => { self.keyboard_status[0x4] = false; 0x4 },
+            0x11 => { self.keyboard_status[0x5] = false; 0x5 },
+            0x12 => { self.keyboard_status[0x6] = false; 0x6 },
+            0x1E => { self.keyboard_status[0x7] = false; 0x7 },
+            0x1F => { self.keyboard_status[0x8] = false; 0x8 },
+            0x20 => { self.keyboard_status[0x9] = false; 0x9 },
+            0x2C => { self.keyboard_status[0xA] = false; 0xA },
+            0x2E => { self.keyboard_status[0xB] = false; 0xB },
+            0x05 => { self.keyboard_status[0xC] = false; 0xC },
+            0x13 => { self.keyboard_status[0xD] = false; 0xD },
+            0x21 => { self.keyboard_status[0xE] = false; 0xE },
+            0x2F => { self.keyboard_status[0xF] = false; 0xF },
+            _ => return Ok(()),
+        };
+
+        self.internals.as_ref().key_up_event(keycode)
+    }
+
+    fn draw(&mut self, ctx: &mut ggez::Context) -> ggez::GameResult {
+        self.internals.as_ref().draw(ctx)
+    }
+}
+
+struct EmulatorInternals {
+    _pin: std::marker::PhantomPinned,                 // self-referential
+    keyboard_send_channel: Mutex<Sender<KeyMessage>>, // communicate press/release events
+    screen: Screen,
+    core: Mutex<Chip8<'static>>,
+    update_sync_pair: Arc<(Condvar, Mutex<State>)>,
+    // dyn Fn(...) is !Unpin
+    time_setter: Pin<Box<dyn Fn(u8) + 'static + Send + Sync>>,
+    time_getter: Pin<Box<dyn Fn() -> u8 + 'static + Send + Sync>>,
+    sound_setter: Pin<Box<dyn Fn(u8) + 'static + Send + Sync>>,
+    next_rand: Pin<Box<dyn Fn() -> u8 + 'static + Send + Sync>>,
+    is_pressed: Pin<Box<dyn Fn(u8) -> bool + 'static + Send + Sync>>,
+    wait_for_key: Pin<Box<dyn Fn() -> u8 + 'static + Send + Sync>>,
+}
+
+impl EmulatorInternals {
+    fn new(
+        ctx: &ggez::Context,
+        program: &[u8],
+        sync_pair: Arc<(Condvar, Mutex<State>)>,
+    ) -> ggez::GameResult<Pin<Arc<Self>>> {
         let screen = Screen::new(ctx)?;
 
         /* create system sound */
@@ -65,25 +244,60 @@ impl<'a> Emulator<'a> {
         };
 
         let (tx, rx): (Sender<KeyMessage>, Receiver<KeyMessage>) = mpsc::channel();
-
-        let keyboard = KeyboardManager::init(rx);
+        let (keyboard, kb_pair) = KeyboardManager::new(rx);
         let kb1 = Arc::clone(&keyboard);
-        let kb2 = Arc::clone(&keyboard);
+        let pair = Arc::clone(&sync_pair);
 
-        let mut res = Box::new(Self {
+        // IMPORTANT: the wait_for_key callback must update the State mutex in the calling thread
+        // (i.e. it shouldn't spawn a new thread and modify the State mutex from it)
+        let wait_for_key = move || {
+            // signal the emulator thread
+            let (cond, mtx) = pair.as_ref();
+            {
+                let mut state = mtx.lock().unwrap();
+                *state = State::WaitingForKey;
+            }
+            cond.notify_all();
+
+            // signal the keyboard thread
+            let (kb_cond, kb_mtx) = kb_pair.as_ref();
+            {
+                let mut kb_state = kb_mtx.lock().unwrap();
+                *kb_state = KeyboardState::Waiting;
+            }
+            kb_cond.notify_all();
+
+            let mut kb_state = kb_mtx.lock().unwrap();
+            let res;
+            loop {
+                kb_state = kb_cond.wait(kb_state).unwrap();
+                match *kb_state {
+                    KeyboardState::Normal => continue,
+                    KeyboardState::Waiting => continue,
+                    KeyboardState::PressedWhileWaiting(val) => {
+                        *kb_state = KeyboardState::Normal;
+                        res = val;
+                        break;
+                    }
+                }
+            }
+            kb_cond.notify_all();
+
+            res
+        };
+
+        let res = Arc::pin(Self {
             _pin: std::marker::PhantomPinned::default(),
-            sleeper: spin_sleep::SpinSleeper::default(),
-            //keyboard: kb,
-            keyboard_status: [false; 16],
-            keyboard_send_channel: tx,
+            keyboard_send_channel: Mutex::new(tx),
             screen,
+            update_sync_pair: sync_pair,
             sound_setter: Box::pin(move |x| st.set(x)),
             time_setter: Box::pin(move |x| dt1.set(x)),
             time_getter: Box::pin(move || dt2.get()),
             next_rand: Box::pin(rand::random::<u8>),
             is_pressed: Box::pin(move |x| kb1.is_pressed(x)),
-            wait_for_key: Box::pin(move || kb2.wait_for_key()),
-            core: chip_8_core::Chip8::new(&[], callbacks),
+            wait_for_key: Box::pin(wait_for_key),
+            core: Mutex::new(Chip8::new(&[], callbacks)),
         });
 
         /* Safety:
@@ -100,15 +314,22 @@ impl<'a> Emulator<'a> {
          * https://github.com/rust-lang/unsafe-code-guidelines/issues/326
          * https://github.com/rust-lang/unsafe-code-guidelines/issues/148
          */
-        let rng = unsafe { &*(res.next_rand.as_ref().get_ref() as *const dyn Fn() -> u8) };
-        let sound_setter = unsafe { &*(res.sound_setter.as_ref().get_ref() as *const dyn Fn(u8)) };
-        let time_setter = unsafe { &*(res.time_setter.as_ref().get_ref() as *const dyn Fn(u8)) };
-        let time_getter =
-            unsafe { &*(res.time_getter.as_ref().get_ref() as *const dyn Fn() -> u8) };
-        let is_pressed =
-            unsafe { &*(res.is_pressed.as_ref().get_ref() as *const dyn Fn(u8) -> bool) };
-        let wait_for_key =
-            unsafe { &*(res.wait_for_key.as_ref().get_ref() as *const dyn Fn() -> u8) };
+        let rng = unsafe {
+            &*(res.next_rand.as_ref().get_ref() as *const (dyn Fn() -> u8 + Send + Sync))
+        };
+        let sound_setter =
+            unsafe { &*(res.sound_setter.as_ref().get_ref() as *const (dyn Fn(u8) + Send + Sync)) };
+        let time_setter =
+            unsafe { &*(res.time_setter.as_ref().get_ref() as *const (dyn Fn(u8) + Send + Sync)) };
+        let time_getter = unsafe {
+            &*(res.time_getter.as_ref().get_ref() as *const (dyn Fn() -> u8 + Send + Sync))
+        };
+        let is_pressed = unsafe {
+            &*(res.is_pressed.as_ref().get_ref() as *const (dyn Fn(u8) -> bool + Send + Sync))
+        };
+        let wait_for_key = unsafe {
+            &*(res.wait_for_key.as_ref().get_ref() as *const (dyn Fn() -> u8 + Send + Sync))
+        };
 
         let callbacks = IOCallbacks {
             sound_setter,
@@ -119,160 +340,116 @@ impl<'a> Emulator<'a> {
             rng,
         };
 
-        res.core = chip_8_core::Chip8::new(program, callbacks);
+        {
+            let mut x = res.core.lock().unwrap();
+            let y = &mut *x;
+            *y = Chip8::new(program, callbacks);
+        }
 
-        Ok(Box::into_pin(res))
+        let temp = res.clone();
+        std::thread::spawn(move || {
+            let x = temp.as_ref();
+            x.start();
+        });
+
+        Ok(res)
     }
 
-    pub fn update(mut self: Pin<&mut Self>) -> ggez::GameResult {
-        use std::time::{Duration, SystemTime};
+    fn start(self: Pin<&Self>) {
+        let (cond, mtx) = self.update_sync_pair.as_ref();
 
-        const TARGET_EMULATION_CLOCK_SPEED: Duration = Duration::from_millis(2);
-        const TARGET_ACCURACY: u64 = TARGET_EMULATION_CLOCK_SPEED.subsec_nanos() as u64 / 4;
-        const INSTRUCTIONS_PER_TICK: u32 = 4;
-        const TIME_BUDGET: u64 = TARGET_EMULATION_CLOCK_SPEED
-            .saturating_mul(INSTRUCTIONS_PER_TICK)
-            .subsec_nanos() as u64;
+        /* emulator thread loop */
+        loop {
+            // wait for next "update" signal
+            {
+                let mut state = mtx.lock().unwrap();
 
-        let now = SystemTime::now();
+                // still waiting from a previous iteration?
+                if *state == State::WaitingForKey {
+                    drop(state);
+                    std::thread::yield_now();
+                    continue;
+                }
 
-        let mut i: u32 = 0;
-        while i < INSTRUCTIONS_PER_TICK {
-            self.as_mut().execute_next_instruction();
-            i += 1;
+                while *state != State::UpdateRequested {
+                    state = cond.wait(state).unwrap();
+                }
+            }
+
+            // will block on `wait_for_key`
+            self.execute_next_instruction();
+        }
+    }
+
+    fn draw(self: Pin<&Self>, ctx: &mut ggez::Context) -> ggez::GameResult {
+        let lock = self.core.try_lock();
+
+        // the emulator thread might hold onto `core` if it's waiting on a keypress, in which case
+        // we don't have to update the window content
+        if lock.is_err() {
+            return Ok(());
         }
 
-        let elapsed = now.elapsed().unwrap().subsec_nanos() as u64;
-        let diff = TIME_BUDGET - elapsed;
+        let core_mtx = lock.unwrap();
+        self.as_ref().pin_get_screen().draw(ctx, core_mtx.fb_ref())
+    }
 
-        if diff > TARGET_ACCURACY {
-            self.sleeper.sleep_ns(diff);
-        }
+    fn key_down_event(self: Pin<&Self>, keycode: u8) -> Result<(), ggez::GameError> {
+        self.keyboard_send_channel
+            .lock()
+            .unwrap()
+            .send((keycode, KeyAction::Pressed))
+            .unwrap();
 
         Ok(())
     }
 
-    pub fn draw(self: Pin<&Self>, ctx: &mut ggez::Context) -> ggez::GameResult {
-        self.as_ref()
-            .pin_get_screen()
-            .draw(ctx, self.as_ref().pin_get_framebuffer())
-    }
-
-    pub fn key_down_event(
-        mut self: Pin<&mut Self>,
-        input: ggez::input::keyboard::KeyInput,
-    ) -> Result<(), ggez::GameError> {
-        // safety: pin_get_keyboard_status() is actually safe
-        #[rustfmt::skip]
-        let keycode: u8 = match input.scancode {
-            0x2D => unsafe { if !self.keyboard_status[0x0] {self.as_mut().pin_get_keyboard_status()[0x0] = true; 0x0} else { return Ok(()) } },
-            0x02 => unsafe { if !self.keyboard_status[0x1] {self.as_mut().pin_get_keyboard_status()[0x1] = true; 0x1} else { return Ok(()) } },
-            0x03 => unsafe { if !self.keyboard_status[0x2] {self.as_mut().pin_get_keyboard_status()[0x2] = true; 0x2} else { return Ok(()) } },
-            0x04 => unsafe { if !self.keyboard_status[0x3] {self.as_mut().pin_get_keyboard_status()[0x3] = true; 0x3} else { return Ok(()) } },
-            0x10 => unsafe { if !self.keyboard_status[0x4] {self.as_mut().pin_get_keyboard_status()[0x4] = true; 0x4} else { return Ok(()) } },
-            0x11 => unsafe { if !self.keyboard_status[0x5] {self.as_mut().pin_get_keyboard_status()[0x5] = true; 0x5} else { return Ok(()) } },
-            0x12 => unsafe { if !self.keyboard_status[0x6] {self.as_mut().pin_get_keyboard_status()[0x6] = true; 0x6} else { return Ok(()) } },
-            0x1E => unsafe { if !self.keyboard_status[0x7] {self.as_mut().pin_get_keyboard_status()[0x7] = true; 0x7} else { return Ok(()) } },
-            0x1F => unsafe { if !self.keyboard_status[0x8] {self.as_mut().pin_get_keyboard_status()[0x8] = true; 0x8} else { return Ok(()) } },
-            0x20 => unsafe { if !self.keyboard_status[0x9] {self.as_mut().pin_get_keyboard_status()[0x9] = true; 0x9} else { return Ok(()) } },
-            0x2C => unsafe { if !self.keyboard_status[0xA] {self.as_mut().pin_get_keyboard_status()[0xA] = true; 0xA} else { return Ok(()) } },
-            0x2E => unsafe { if !self.keyboard_status[0xB] {self.as_mut().pin_get_keyboard_status()[0xB] = true; 0xB} else { return Ok(()) } },
-            0x05 => unsafe { if !self.keyboard_status[0xC] {self.as_mut().pin_get_keyboard_status()[0xC] = true; 0xC} else { return Ok(()) } },
-            0x13 => unsafe { if !self.keyboard_status[0xD] {self.as_mut().pin_get_keyboard_status()[0xD] = true; 0xD} else { return Ok(()) } },
-            0x21 => unsafe { if !self.keyboard_status[0xE] {self.as_mut().pin_get_keyboard_status()[0xE] = true; 0xE} else { return Ok(()) } },
-            0x2F => unsafe { if !self.keyboard_status[0xF] {self.as_mut().pin_get_keyboard_status()[0xF] = true; 0xF} else { return Ok(()) } },
-            _ => return Ok(()),
-        };
-
-        let err = self
-            .keyboard_send_channel
-            .send((keycode, KeyAction::Pressed));
-
-        if err.is_err() {
-            return Err(ggez::GameError::CustomError(String::from(
-                "Error while trying to communicate with keyboard thread",
-            )));
-        }
+    fn key_up_event(self: Pin<&Self>, keycode: u8) -> Result<(), ggez::GameError> {
+        self.keyboard_send_channel
+            .lock()
+            .unwrap()
+            .send((keycode, KeyAction::Released))
+            .unwrap();
 
         Ok(())
-    }
-
-    pub fn key_up_event(
-        mut self: Pin<&mut Self>,
-        input: ggez::input::keyboard::KeyInput,
-    ) -> Result<(), ggez::GameError> {
-        // safety: pin_get_keyboard_status() is actually safe
-        #[rustfmt::skip]
-        let keycode: u8 = match input.scancode {
-            0x2D => unsafe { self.as_mut().pin_get_keyboard_status()[0x0] = false; 0x0 },
-            0x02 => unsafe { self.as_mut().pin_get_keyboard_status()[0x1] = false; 0x1 },
-            0x03 => unsafe { self.as_mut().pin_get_keyboard_status()[0x2] = false; 0x2 },
-            0x04 => unsafe { self.as_mut().pin_get_keyboard_status()[0x3] = false; 0x3 },
-            0x10 => unsafe { self.as_mut().pin_get_keyboard_status()[0x4] = false; 0x4 },
-            0x11 => unsafe { self.as_mut().pin_get_keyboard_status()[0x5] = false; 0x5 },
-            0x12 => unsafe { self.as_mut().pin_get_keyboard_status()[0x6] = false; 0x6 },
-            0x1E => unsafe { self.as_mut().pin_get_keyboard_status()[0x7] = false; 0x7 },
-            0x1F => unsafe { self.as_mut().pin_get_keyboard_status()[0x8] = false; 0x8 },
-            0x20 => unsafe { self.as_mut().pin_get_keyboard_status()[0x9] = false; 0x9 },
-            0x2C => unsafe { self.as_mut().pin_get_keyboard_status()[0xA] = false; 0xA },
-            0x2E => unsafe { self.as_mut().pin_get_keyboard_status()[0xB] = false; 0xB },
-            0x05 => unsafe { self.as_mut().pin_get_keyboard_status()[0xC] = false; 0xC },
-            0x13 => unsafe { self.as_mut().pin_get_keyboard_status()[0xD] = false; 0xD },
-            0x21 => unsafe { self.as_mut().pin_get_keyboard_status()[0xE] = false; 0xE },
-            0x2F => unsafe { self.as_mut().pin_get_keyboard_status()[0xF] = false; 0xF },
-            _ => return Ok(()),
-        };
-
-        let err = self
-            .keyboard_send_channel
-            .send((keycode, KeyAction::Released));
-
-        if err.is_err() {
-            return Err(ggez::GameError::CustomError(String::from(
-                "Error while trying to communicate with keyboard thread",
-            )));
-        }
-
-        Ok(())
-        /* Needed on Linux?
-        0x82 => Some(0x1),
-        0x83 => Some(0x2),
-        0x84 => Some(0x3),
-        0x85 => Some(0xC),
-        0x90 => Some(0x4),
-        0x91 => Some(0x5),
-        0x92 => Some(0x6),
-        0x93 => Some(0xD),
-        0x9E => Some(0x7),
-        0x9F => Some(0x8),
-        0xA0 => Some(0x9),
-        0xA1 => Some(0xE),
-        0xAC => Some(0xA),
-        0xAD => Some(0x0),
-        0xAE => Some(0xB),
-        0xAF => Some(0xF),
-        _ => None, */
     }
 
     fn pin_get_screen(self: Pin<&Self>) -> &Screen {
         &self.get_ref().screen
     }
 
-    fn pin_get_framebuffer(self: Pin<&Self>) -> &FrameBuffer {
-        self.get_ref().core.fb_ref()
-    }
+    fn execute_next_instruction(self: Pin<&Self>) {
+        // will block on `wait_for_key`
+        {
+            self.core.lock().unwrap().execute_next_instruction();
+        }
 
-    // safety: safe to use anywhere, since arrays are Copy
-    unsafe fn pin_get_keyboard_status(self: Pin<&mut Self>) -> &mut [bool; 16] {
-        &mut self.get_unchecked_mut().keyboard_status
-    }
-
-    fn execute_next_instruction(self: Pin<&mut Self>) {
-        /* if waiting on key
-         *     send waiting message
-         * else
-         */
-        /* Safety: execute_next_instruction() doesn't move data out of core */
-        unsafe { self.get_unchecked_mut().core.execute_next_instruction() }
+        // `mtx` is shared with the main thread, so it's important to lock it only once we're sure
+        // we can no longer block
+        let (cond, mtx) = self.update_sync_pair.as_ref();
+        {
+            let mut state = mtx.lock().unwrap();
+            *state = State::Ready;
+        }
+        cond.notify_all();
     }
 }
+
+/* Needed on Linux?
+0x82 => Some(0x1),
+0x83 => Some(0x2),
+0x84 => Some(0x3),
+0x85 => Some(0xC),
+0x90 => Some(0x4),
+0x91 => Some(0x5),
+0x92 => Some(0x6),
+0x93 => Some(0xD),
+0x9E => Some(0x7),
+0x9F => Some(0x8),
+0xA0 => Some(0x9),
+0xA1 => Some(0xE),
+0xAC => Some(0xA),
+0xAD => Some(0x0),
+0xAE => Some(0xB),
+0xAF => Some(0xF),
+_ => None, */
