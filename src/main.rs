@@ -9,7 +9,6 @@ use emulator::*;
 use screen::*;
 
 fn main() -> ggez::GameResult {
-
     let args: Vec<String> = std::env::args().collect();
 
     let filepath = &args[1];
@@ -36,7 +35,7 @@ fn main() -> ggez::GameResult {
     let window_setup = ggez::conf::WindowSetup {
         title: String::from("Chip-8 Emulator"),
         samples: ggez::conf::NumSamples::One,
-        vsync: false,
+        vsync: true,
         icon: String::new(), // TODO
         srgb: false,
     };
