@@ -5,9 +5,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-chip-8-core = { path = "../chip-8-core" } #, features = ["legacy-opcodes"] }
-#chip-8-core = { git = "https://github.com/st-ario/chip-8-core.git" } #, features = ["legacy-opcodes"] }
+chip-8-core = { path = "../chip-8-core", features = ["no-std"] }
+#chip-8-core = { git = "https://github.com/st-ario/chip-8-core.git", features = ["no-std"] }
 ggez = "0.8.1"
 rand = { version = "0.8.5", features = ["small_rng"] }
 spin_sleep = "1.1.1"
 wgpu = "0.14.2"
+
+#[profile.release]
+#debug = true
