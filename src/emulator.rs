@@ -10,14 +10,14 @@ use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
-pub const DEFAULT_CLOCK_SPEED: u16 = 1000;
+pub const DEFAULT_CLOCK_SPEED: u16 = 500;
 
 pub struct Emulator {
     internals: Pin<Arc<EmulatorInternals>>,
     sleeper: spin_sleep::SpinSleeper,
     keyboard_status: [bool; 16],
-    clock_speed: u16,
     update_sync_pair: Arc<(Condvar, Mutex<State>)>,
+    esp: EmulationSpeedParams,
 }
 
 /* state machine to handle waiting on a keypress */
@@ -29,6 +29,41 @@ enum State {
     WaitingForKey,
 }
 
+struct EmulationSpeedParams {
+    instructions_per_tick: u64,
+    time_budget_ns: u64,
+    target_accuracy_ns: u64,
+}
+
+impl EmulationSpeedParams {
+    fn new(clock_speed: u16) -> Self {
+        let target_clock_ns: u64 = (1_000_000_000.0 / clock_speed as f64) as u64;
+
+        /* multiple instructions per tick, to reduce jittering */
+        // if the nubmer is too high, the input lag will become noticeable;
+        // input lag should stay below 50 ms
+        // as the emulated clock should be in the 400-1000 Hz, 10 instruction per emulator tick
+        // should keep the input lag at 10-25 ms + system input lag (negligible)
+        let instructions_per_tick: u64 = 10;
+        let time_budget_ns: u64 = target_clock_ns * instructions_per_tick;
+
+        /* time-skipping */
+        // sleep only if we're ahead of more than 1/ACCURACY_FACTOR of
+        // a target-clock-tick (on average, checked per emulator tick)
+        // this means that we will skip the sleeping instruction only if the emulator tick took
+        // almost as much time as the emulated system would have taken, or longer
+        // (highly unlikely on a modern computer)
+        let accuracy_factor: u64 = 10;
+        let target_accuracy_ns: u64 = instructions_per_tick * target_clock_ns / accuracy_factor;
+
+        Self {
+            instructions_per_tick,
+            time_budget_ns,
+            target_accuracy_ns,
+        }
+    }
+}
+
 impl Emulator {
     pub fn new(ctx: &ggez::Context, options: &ProgramOptions) -> ggez::GameResult<Self> {
         let sync_pair = Arc::new((Condvar::new(), Mutex::new(State::default())));
@@ -38,43 +73,38 @@ impl Emulator {
             internals: EmulatorInternals::new(ctx, options, sync_copy)?,
             sleeper: spin_sleep::SpinSleeper::default(),
             keyboard_status: [false; 16],
-            clock_speed: options.clock_speed,
             update_sync_pair: sync_pair,
+            esp: EmulationSpeedParams::new(options.clock_speed),
         })
     }
 }
 
 impl ggez::event::EventHandler<ggez::GameError> for Emulator {
     fn update(&mut self, _ctx: &mut ggez::Context) -> ggez::GameResult {
+        use once_cell::unsync::Lazy;
         use std::time::SystemTime;
+        static mut TICK: Lazy<SystemTime> = Lazy::new(SystemTime::now);
 
-        /* emulation speed parameters */
-        let target_clock_ns: u64 = (1_000_000.0 / self.clock_speed as f64) as u64;
+        /* time skipping (see EmulationSpeedParams documentation) */
+        {
+            // safety: update() is called only from one thread, and TICK is scoped to this function
+            let elapsed = unsafe { TICK.elapsed().unwrap().subsec_nanos() as u64 };
 
-        /* multiple instructions per tick, to reduce jittering */
-        // if the nubmer is too high, the input lag will become noticeable;
-        // input lag should stay below 50 ms
-        // as the emulated clock should be in the 400-1000 Hz, 10 instruction per emulator tick
-        // should keep the input lag at 10-25 ms + system input lag (negligible)
-        const INSTRUCTIONS_PER_TICK: u64 = 10;
-        let time_budget_ns: u64 = target_clock_ns * INSTRUCTIONS_PER_TICK;
+            // avoiding overflow in `if (TIME_BUDGET - elapsed > TARGET_ACCURACY)`
+            if self.esp.time_budget_ns > self.esp.target_accuracy_ns + elapsed {
+                self.sleeper.sleep_ns(self.esp.time_budget_ns - elapsed);
+            }
 
-        /* time-skipping */
-        // sleep only if we're ahead of more than 1/ACCURACY_FACTOR of
-        // a target-clock-tick (on average, checked per emulator tick)
-        // this means that we will skip the sleeping instruction only if the emulator tick took
-        // almost as much time as the emulated system would have taken, or longer
-        // (highly unlikely on a modern computer)
-        const ACCURACY_FACTOR: u64 = 10;
-        let target_accuracy_ns: u64 = INSTRUCTIONS_PER_TICK * target_clock_ns / ACCURACY_FACTOR;
+            // safety: update() is called only from one thread, and TICK is scoped to this function
+            unsafe { *TICK = SystemTime::now() };
+        }
 
-        let now = SystemTime::now();
-
+        /* game tick begins here */
         // this function is called on the main thread by the ggez runtime, so it can't block for too long;
         // `mtx` is shared only with `execute_next_instruction()`, which acquires it only when it
         // can no longer block
         let mut i: u64 = 0;
-        while i < INSTRUCTIONS_PER_TICK {
+        while i < self.esp.instructions_per_tick {
             let (cond, mtx) = self.update_sync_pair.as_ref();
 
             // signal update request, unless we're still waiting from a previous iteration
@@ -109,16 +139,6 @@ impl ggez::event::EventHandler<ggez::GameError> for Emulator {
 
             i += 1;
         }
-
-        let elapsed = now.elapsed().unwrap().subsec_nanos() as u64;
-
-        // avoid underflow in TIME_BUDGET - elapsed > TARGET_ACCURACY
-        if time_budget_ns > target_accuracy_ns + elapsed {
-            self.sleeper.sleep_ns(time_budget_ns - elapsed);
-        }
-
-        // TODO measure time difference between consecutive calls to give an estimate of the
-        // systematic error on our per-tick time management
 
         Ok(())
     }

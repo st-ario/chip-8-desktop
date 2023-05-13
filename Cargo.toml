@@ -8,6 +8,7 @@ edition = "2021"
 #chip-8-core = { path = "../chip-8-core" }
 chip-8-core = { git = "https://github.com/st-ario/chip-8-core.git" }
 ggez = "0.8.1"
+once_cell = "1.17.1"
 rand = { version = "0.8.5", features = ["small_rng"] }
 spin_sleep = "1.1.1"
 wgpu = "0.14.2"

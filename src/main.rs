@@ -29,7 +29,7 @@ fn process_args(args: &Vec<String>) -> Option<ProgramOptions> {
     let mut flag_argument = false;
 
     for (i, arg) in args.iter().enumerate().skip(1) {
-        if arg.starts_with('-') && !flag_argument {
+        if !arg.starts_with('-') && !flag_argument {
             let res = std::fs::read(arg);
             // only argument not requiring flag
             program = res.ok()?;
