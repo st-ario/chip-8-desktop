@@ -1,6 +1,7 @@
 use crate::keyboard::*;
 use crate::screen::*;
 use crate::timers::*;
+use crate::ProgramOptions;
 use chip_8_core::{Chip8, IOCallbacks};
 use ggez::audio::SoundSource;
 use ggez::input::keyboard;
@@ -9,10 +10,13 @@ use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
+pub const DEFAULT_CLOCK_SPEED: u16 = 1000;
+
 pub struct Emulator {
     internals: Pin<Arc<EmulatorInternals>>,
     sleeper: spin_sleep::SpinSleeper,
     keyboard_status: [bool; 16],
+    clock_speed: u16,
     update_sync_pair: Arc<(Condvar, Mutex<State>)>,
 }
 
@@ -26,14 +30,15 @@ enum State {
 }
 
 impl Emulator {
-    pub fn new(ctx: &ggez::Context, program: &[u8]) -> ggez::GameResult<Self> {
+    pub fn new(ctx: &ggez::Context, options: &ProgramOptions) -> ggez::GameResult<Self> {
         let sync_pair = Arc::new((Condvar::new(), Mutex::new(State::default())));
         let sync_copy = Arc::clone(&sync_pair);
 
         Ok(Emulator {
-            internals: EmulatorInternals::new(ctx, program, sync_copy)?,
+            internals: EmulatorInternals::new(ctx, options, sync_copy)?,
             sleeper: spin_sleep::SpinSleeper::default(),
             keyboard_status: [false; 16],
+            clock_speed: options.clock_speed,
             update_sync_pair: sync_pair,
         })
     }
@@ -44,8 +49,7 @@ impl ggez::event::EventHandler<ggez::GameError> for Emulator {
         use std::time::SystemTime;
 
         /* emulation speed parameters */
-        const TARGET_EMULATION_CLOCK_HZ: u16 = 500; // TODO user-settable with default value
-        const TARGET_CLOCK_NS: u64 = (1_000_000.0 / TARGET_EMULATION_CLOCK_HZ as f64) as u64;
+        let target_clock_ns: u64 = (1_000_000.0 / self.clock_speed as f64) as u64;
 
         /* multiple instructions per tick, to reduce jittering */
         // if the nubmer is too high, the input lag will become noticeable;
@@ -53,7 +57,7 @@ impl ggez::event::EventHandler<ggez::GameError> for Emulator {
         // as the emulated clock should be in the 400-1000 Hz, 10 instruction per emulator tick
         // should keep the input lag at 10-25 ms + system input lag (negligible)
         const INSTRUCTIONS_PER_TICK: u64 = 10;
-        const TIME_BUDGET_NS: u64 = TARGET_CLOCK_NS * INSTRUCTIONS_PER_TICK;
+        let time_budget_ns: u64 = target_clock_ns * INSTRUCTIONS_PER_TICK;
 
         /* time-skipping */
         // sleep only if we're ahead of more than 1/ACCURACY_FACTOR of
@@ -62,7 +66,7 @@ impl ggez::event::EventHandler<ggez::GameError> for Emulator {
         // almost as much time as the emulated system would have taken, or longer
         // (highly unlikely on a modern computer)
         const ACCURACY_FACTOR: u64 = 10;
-        const TARGET_ACCURACY_NS: u64 = INSTRUCTIONS_PER_TICK * TARGET_CLOCK_NS / ACCURACY_FACTOR;
+        let target_accuracy_ns: u64 = INSTRUCTIONS_PER_TICK * target_clock_ns / ACCURACY_FACTOR;
 
         let now = SystemTime::now();
 
@@ -109,8 +113,8 @@ impl ggez::event::EventHandler<ggez::GameError> for Emulator {
         let elapsed = now.elapsed().unwrap().subsec_nanos() as u64;
 
         // avoid underflow in TIME_BUDGET - elapsed > TARGET_ACCURACY
-        if TIME_BUDGET_NS > TARGET_ACCURACY_NS + elapsed {
-            self.sleeper.sleep_ns(TIME_BUDGET_NS - elapsed);
+        if time_budget_ns > target_accuracy_ns + elapsed {
+            self.sleeper.sleep_ns(time_budget_ns - elapsed);
         }
 
         // TODO measure time difference between consecutive calls to give an estimate of the
@@ -202,7 +206,7 @@ struct EmulatorInternals {
 impl EmulatorInternals {
     fn new(
         ctx: &ggez::Context,
-        program: &[u8],
+        options: &ProgramOptions,
         sync_pair: Arc<(Condvar, Mutex<State>)>,
     ) -> ggez::GameResult<Pin<Arc<Self>>> {
         let screen = Screen::new(ctx)?;
@@ -297,7 +301,12 @@ impl EmulatorInternals {
             next_rand: Box::pin(rand::random::<u8>),
             is_pressed: Box::pin(move |x| kb1.is_pressed(x)),
             wait_for_key: Box::pin(wait_for_key),
-            core: Mutex::new(Chip8::new(&[], callbacks)),
+            core: Mutex::new(Chip8::new(
+                &[],
+                callbacks,
+                options.clip_sprites,
+                options.schip_compatibility,
+            )),
         });
 
         /* Safety:
@@ -343,7 +352,12 @@ impl EmulatorInternals {
         {
             let mut x = res.core.lock().unwrap();
             let y = &mut *x;
-            *y = Chip8::new(program, callbacks);
+            *y = Chip8::new(
+                &options.program[..],
+                callbacks,
+                options.clip_sprites,
+                options.schip_compatibility,
+            );
         }
 
         let temp = res.clone();
@@ -434,22 +448,3 @@ impl EmulatorInternals {
         cond.notify_all();
     }
 }
-
-/* Needed on Linux?
-0x82 => Some(0x1),
-0x83 => Some(0x2),
-0x84 => Some(0x3),
-0x85 => Some(0xC),
-0x90 => Some(0x4),
-0x91 => Some(0x5),
-0x92 => Some(0x6),
-0x93 => Some(0xD),
-0x9E => Some(0x7),
-0x9F => Some(0x8),
-0xA0 => Some(0x9),
-0xA1 => Some(0xE),
-0xAC => Some(0xA),
-0xAD => Some(0x0),
-0xAE => Some(0xB),
-0xAF => Some(0xF),
-_ => None, */
