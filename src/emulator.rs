@@ -40,11 +40,14 @@ impl EmulationSpeedParams {
         let target_clock_ns: u64 = (1_000_000_000.0 / clock_speed as f64) as u64;
 
         /* multiple instructions per tick, to reduce jittering */
-        // if the nubmer is too high, the input lag will become noticeable;
-        // input lag should stay below 50 ms
-        // as the emulated clock should be in the 400-1000 Hz, 10 instruction per emulator tick
-        // should keep the input lag at 10-25 ms + system input lag (negligible)
-        let instructions_per_tick: u64 = 10;
+        // if the nubmer is too high, many framebuffer updates will be skipped, so the result will
+        // look glitchy; an INSTRUCTIONS_SCALE_FACTOR of 50 has been estimated euristically,
+        // and seems to work well with both "classical" roms (meant to be played in the 400-1000 Hz)
+        // and crazier roms (like the danmaku one, which is intended to be played
+        // at 30.000-60.000 Hz)
+        // In general, high frequency -> more computations -> less frequent draw commands
+        const INSTRUCTIONS_SCALE_FACTOR: u64 = 50;
+        let instructions_per_tick: u64 = clock_speed as u64 / INSTRUCTIONS_SCALE_FACTOR;
         let time_budget_ns: u64 = target_clock_ns * instructions_per_tick;
 
         /* time-skipping */
@@ -53,8 +56,9 @@ impl EmulationSpeedParams {
         // this means that we will skip the sleeping instruction only if the emulator tick took
         // almost as much time as the emulated system would have taken, or longer
         // (highly unlikely on a modern computer)
-        let accuracy_factor: u64 = 10;
-        let target_accuracy_ns: u64 = instructions_per_tick * target_clock_ns / accuracy_factor;
+        // An ACCURACY_FACTOR of 10 seems to work well in all situations
+        const ACCURACY_FACTOR: u64 = 10;
+        let target_accuracy_ns: u64 = instructions_per_tick * target_clock_ns / ACCURACY_FACTOR;
 
         Self {
             instructions_per_tick,
