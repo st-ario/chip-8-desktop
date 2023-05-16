@@ -70,10 +70,10 @@ impl KeyboardManager {
                         let mut state = mtx.lock().unwrap();
                         match *state {
                             KeyboardState::Normal => continue,
+                            KeyboardState::PressedWhileWaiting(_) => continue,
                             KeyboardState::Waiting => {
                                 *state = KeyboardState::PressedWhileWaiting(key)
                             }
-                            KeyboardState::PressedWhileWaiting(_) => unreachable!(),
                         }
                     }
                     cvar.notify_all();
