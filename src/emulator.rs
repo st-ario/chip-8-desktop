@@ -2,6 +2,7 @@ use crate::keyboard::*;
 use crate::screen::*;
 use crate::timers::*;
 use crate::ProgramOptions;
+use chip_8_core::FrameBuffer;
 use chip_8_core::{Chip8, IOCallbacks};
 use ggez::audio::SoundSource;
 use ggez::input::keyboard;
@@ -212,19 +213,22 @@ impl ggez::event::EventHandler<ggez::GameError> for Emulator {
     }
 }
 
+#[rustfmt::skip]
 struct EmulatorInternals {
     _pin: std::marker::PhantomPinned,                 // self-referential
     keyboard_send_channel: Mutex<Sender<KeyMessage>>, // communicate press/release events
     screen: Screen,
     core: Mutex<Chip8<'static>>,
+    fb_copy: Mutex<FrameBuffer>,
     update_sync_pair: Arc<(Condvar, Mutex<State>)>,
     // dyn Fn(...) is !Unpin
-    time_setter: Pin<Box<dyn Fn(u8) + 'static + Send + Sync>>,
-    time_getter: Pin<Box<dyn Fn() -> u8 + 'static + Send + Sync>>,
-    sound_setter: Pin<Box<dyn Fn(u8) + 'static + Send + Sync>>,
-    next_rand: Pin<Box<dyn Fn() -> u8 + 'static + Send + Sync>>,
-    is_pressed: Pin<Box<dyn Fn(u8) -> bool + 'static + Send + Sync>>,
-    wait_for_key: Pin<Box<dyn Fn() -> u8 + 'static + Send + Sync>>,
+    time_setter:  Pin<Box<dyn Fn(u8)         + 'static + Send + Sync>>,
+    time_getter:  Pin<Box<dyn Fn()   -> u8   + 'static + Send + Sync>>,
+    sound_setter: Pin<Box<dyn Fn(u8)         + 'static + Send + Sync>>,
+    next_rand:    Pin<Box<dyn Fn()   -> u8   + 'static + Send + Sync>>,
+    is_pressed:   Pin<Box<dyn Fn(u8) -> bool + 'static + Send + Sync>>,
+    wait_for_key: Pin<Box<dyn Fn()   -> u8   + 'static + Send + Sync>>,
+    draw_signal:  Pin<Box<dyn Fn()           + 'static + Send + Sync>>,
 }
 
 impl EmulatorInternals {
@@ -269,6 +273,7 @@ impl EmulatorInternals {
             is_pressed: &|_x| false,
             wait_for_key: &|| 0,
             rng: &|| 0,
+            draw_signal: &|| (),
         };
 
         let (tx, rx): (Sender<KeyMessage>, Receiver<KeyMessage>) = mpsc::channel();
@@ -318,6 +323,7 @@ impl EmulatorInternals {
             _pin: std::marker::PhantomPinned::default(),
             keyboard_send_channel: Mutex::new(tx),
             screen,
+            fb_copy: Mutex::new(chip_8_core::EMPTY_FRAMEBUFFER),
             update_sync_pair: sync_pair,
             sound_setter: Box::pin(move |x| st.set(x)),
             time_setter: Box::pin(move |x| dt1.set(x)),
@@ -325,6 +331,7 @@ impl EmulatorInternals {
             next_rand: Box::pin(rand::random::<u8>),
             is_pressed: Box::pin(move |x| kb1.is_pressed(x)),
             wait_for_key: Box::pin(wait_for_key),
+            draw_signal: Box::pin(|| {}),
             core: Mutex::new(Chip8::new(
                 &[],
                 callbacks,
@@ -363,6 +370,8 @@ impl EmulatorInternals {
         let wait_for_key = unsafe {
             &*(res.wait_for_key.as_ref().get_ref() as *const (dyn Fn() -> u8 + Send + Sync))
         };
+        let draw_signal =
+            unsafe { &*(res.draw_signal.as_ref().get_ref() as *const (dyn Fn() + Send + Sync)) };
 
         let callbacks = IOCallbacks {
             sound_setter,
@@ -371,6 +380,7 @@ impl EmulatorInternals {
             is_pressed,
             wait_for_key,
             rng,
+            draw_signal,
         };
 
         {
@@ -420,16 +430,8 @@ impl EmulatorInternals {
     }
 
     fn draw(self: Pin<&Self>, ctx: &mut ggez::Context) -> ggez::GameResult {
-        let lock = self.core.try_lock();
-
-        // the emulator thread might hold onto `core` if it's waiting on a keypress, in which case
-        // we don't have to update the window content
-        if lock.is_err() {
-            return Ok(());
-        }
-
-        let core_mtx = lock.unwrap();
-        self.as_ref().pin_get_screen().draw(ctx, core_mtx.fb_ref())
+        let fb = self.fb_copy.lock().unwrap();
+        self.as_ref().pin_get_screen().draw(ctx, &fb)
     }
 
     fn key_down_event(self: Pin<&Self>, keycode: u8) -> Result<(), ggez::GameError> {
@@ -459,7 +461,14 @@ impl EmulatorInternals {
     fn execute_next_instruction(self: Pin<&Self>) {
         // will block on `wait_for_key`
         {
-            self.core.lock().unwrap().execute_next_instruction();
+            let mut core_mtx = self.core.lock().unwrap();
+            core_mtx.execute_next_instruction();
+            // update framebuffer
+            // TODO document
+            {
+                let mut fb_mtx = self.fb_copy.lock().unwrap();
+                *fb_mtx = *core_mtx.fb_ref();
+            }
         }
 
         // `mtx` is shared with the main thread, so it's important to lock it only once we're sure
