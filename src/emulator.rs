@@ -463,8 +463,10 @@ impl EmulatorInternals {
         {
             let mut core_mtx = self.core.lock().unwrap();
             core_mtx.execute_next_instruction();
-            // update framebuffer
-            // TODO document
+            /* update framebuffer */
+            // updating at every instruction has been measured to have no impact whatsoever, and
+            // it's by far the easiest way to make sure that the framebuffer update issued between
+            // the start of an emulator tick and a `wait_for_key` are drawn while we're waiting
             {
                 let mut fb_mtx = self.fb_copy.lock().unwrap();
                 *fb_mtx = *core_mtx.fb_ref();
